@@ -15,6 +15,89 @@ import torch
 import importlib
 import time
 import numpy as np
+import subprocess
+import threading
+import io
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from PIL import Image
+
+# 用于 MJPEG 流的全局变量
+_latest_frame = None
+_frame_lock = threading.Lock()
+_streaming_active = True
+
+
+class MJPEGHandler(BaseHTTPRequestHandler):
+    """处理 MJPEG 流请求的 HTTP 处理器"""
+
+    def log_message(self, format, *args):
+        """禁用默认的日志输出"""
+        pass
+
+    def do_GET(self):
+        if self.path == '/':
+            # 返回简单的 HTML 页面
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            html = b'''<!DOCTYPE html>
+<html>
+<head><title>Camera Stream</title></head>
+<body style="margin:0;background:#000;display:flex;justify-content:center;align-items:center;min-height:100vh;">
+<img src="/stream" style="max-width:100%;max-height:100vh;">
+</body>
+</html>'''
+            self.wfile.write(html)
+        elif self.path == '/stream':
+            # MJPEG 流
+            self.send_response(200)
+            self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
+            self.end_headers()
+
+            global _streaming_active
+            while _streaming_active:
+                with _frame_lock:
+                    if _latest_frame is not None:
+                        try:
+                            # 将 numpy 数组转换为 JPEG
+                            img = Image.fromarray(_latest_frame)
+                            buffer = io.BytesIO()
+                            img.save(buffer, format='JPEG', quality=80)
+                            frame_data = buffer.getvalue()
+
+                            # 发送 MJPEG 帧
+                            self.wfile.write(b'--frame\r\n')
+                            self.send_header('Content-Type', 'image/jpeg')
+                            self.send_header('Content-Length', len(frame_data))
+                            self.end_headers()
+                            self.wfile.write(frame_data)
+                            self.wfile.write(b'\r\n')
+                        except Exception:
+                            break
+                time.sleep(0.03)  # 约 30 FPS
+        else:
+            self.send_error(404)
+
+
+def start_mjpeg_server(port=8080):
+    """在后台线程启动 MJPEG 服务器"""
+    global _streaming_active
+
+    def run_server():
+        server = HTTPServer(('localhost', port), MJPEGHandler)
+        server.serve_forever()
+
+    _streaming_active = True
+    thread = threading.Thread(target=run_server, daemon=True)
+    thread.start()
+    return thread
+
+
+def update_camera_frame(frame):
+    """更新相机帧"""
+    global _latest_frame
+    with _frame_lock:
+        _latest_frame = frame.copy()
 from lerobot.policies.utils import get_device_from_parameters
 from lerobot.configs import parser
 from lerobot.configs.eval import EvalPipelineConfig
@@ -171,6 +254,28 @@ def main(env, policy, env_preprocessor, env_postprocessor, preprocessor, postpro
         print("Falling back to headless mode.")
         viewer = DummyViewer()
 
+    # 启动 MJPEG 流服务器
+    # 由于 mjpython 与 OpenCV/Tkinter 等 GUI 库不兼容，使用 HTTP + MJPEG 流显示
+    server_port = 8080
+    start_mjpeg_server(server_port)
+    print(f"MJPEG stream server started at http://localhost:{server_port}")
+
+    # 在浏览器中打开
+    try:
+        subprocess.run(['open', f'http://localhost:{server_port}'], check=True)
+        print("Camera stream opened in browser!")
+    except Exception as e:
+        print(f"Could not open browser: {e}")
+        print(f"Please manually open: http://localhost:{server_port}")
+
+    # 获取环境中的 camera 名称列表（如果可用）
+    model = env.unwrapped.model
+    camera_names = []
+    if hasattr(model, 'camera') and hasattr(model.camera, 'names'):
+        camera_names = [name.decode('utf-8') if isinstance(name, bytes) else name
+                        for name in model.camera.names if name]
+    print(f"Available cameras: {camera_names if camera_names else 'default camera'}")
+
     # Reset the environment to get the initial observation.
     observation, info = env.reset(seed=42)
 
@@ -231,6 +336,18 @@ def main(env, policy, env_preprocessor, env_postprocessor, preprocessor, postpro
             # Apply the action to the environment and get the next observation.
             observation, reward, terminated, truncated, info = env.step(action_numpy[0])
 
+            # 获取并更新 camera 观测画面到 MJPEG 流
+            try:
+                # 使用 env.render() 获取渲染图像
+                camera_image = env.render()
+
+                if camera_image is not None:
+                    # 更新到 MJPEG 流
+                    update_camera_frame(camera_image)
+            except Exception as render_error:
+                # 静默忽略渲染错误，避免干扰主循环
+                pass
+
             # Sync the viewer to reflect the new state.
             viewer.sync()
 
@@ -260,6 +377,11 @@ def main(env, policy, env_preprocessor, env_postprocessor, preprocessor, postpro
 
     viewer.close()
     env.close()
+
+    # 停止 MJPEG 流
+    global _streaming_active
+    _streaming_active = False
+
     print("Viewer closed. Exiting.")
 
 
