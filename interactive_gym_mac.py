@@ -103,8 +103,7 @@ from lerobot.configs import parser
 from lerobot.configs.eval import EvalPipelineConfig
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.envs.factory import make_env, make_env_pre_post_processors
-from lerobot.envs.utils import add_envs_task, preprocess_observation
-from lerobot.utils.utils import get_safe_torch_device
+from lerobot.envs.utils import preprocess_observation
 
 
 class DummyViewer:
